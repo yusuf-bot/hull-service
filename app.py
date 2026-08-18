@@ -1,14 +1,14 @@
 """Hull tunnel service — OAuth-protected tunnels for hull MCP servers.
 
 Auth model:
-- Each tunnel has an allowed_email (optional)
-- If allowed_email is set, Claude Desktop does OAuth flow
-- hull-service verifies the email matches before granting access
-- If no allowed_email, tunnel is open (anyone with URL can access)
+- Each tunnel has allowed_emails (optional JSON array)
+- If allowed_emails is set, Claude Desktop does OAuth flow
+- hull-service verifies the email is in the list before granting access
+- If no allowed_emails, tunnel is open (anyone with URL can access)
 """
 
 import hashlib
-import hmac
+import json
 import os
 import secrets
 import sqlite3
@@ -38,7 +38,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS tunnels (
     tunnel_id TEXT PRIMARY KEY,
     url_token TEXT UNIQUE,
-    allowed_email TEXT,
+    allowed_emails TEXT,
     machine_name TEXT,
     created_at TEXT,
     expires_at TEXT,
@@ -89,7 +89,7 @@ def _hash(value: str) -> str:
 class TunnelCreate(BaseModel):
     machine_name: str
     ttl_seconds: int = DEFAULT_TTL
-    allowed_email: str | None = None
+    allowed_emails: list[str] | None = None
 
 
 class TunnelResponse(BaseModel):
@@ -97,7 +97,7 @@ class TunnelResponse(BaseModel):
     url: str
     expires_at: str
     ttl_seconds: int
-    allowed_email: str | None = None
+    allowed_emails: list[str] | None = None
 
 
 # ─── App ─────────────────────────────────────────────────────────────────────
@@ -133,12 +133,15 @@ async def create_tunnel(req: TunnelCreate):
         time.time() + ttl, tz=timezone.utc
     ).isoformat()
 
+    # Store emails as JSON array
+    emails_json = json.dumps(req.allowed_emails) if req.allowed_emails else None
+
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO tunnels (tunnel_id, url_token, allowed_email, machine_name, created_at, expires_at, active) "
+            "INSERT INTO tunnels (tunnel_id, url_token, allowed_emails, machine_name, created_at, expires_at, active) "
             "VALUES (?, ?, ?, ?, ?, ?, 1)",
-            (tunnel_id, url_token, req.allowed_email, req.machine_name,
+            (tunnel_id, url_token, emails_json, req.machine_name,
              datetime.now(timezone.utc).isoformat(), expires_at),
         )
         conn.commit()
@@ -150,7 +153,7 @@ async def create_tunnel(req: TunnelCreate):
         url=f"{BASE_URL}/{url_token}",
         expires_at=expires_at,
         ttl_seconds=ttl,
-        allowed_email=req.allowed_email,
+        allowed_emails=req.allowed_emails,
     )
 
 
@@ -177,13 +180,15 @@ async def tunnel_status(tunnel_id: str):
         finally:
             conn.close()
 
+    allowed_emails = json.loads(row["allowed_emails"]) if row["allowed_emails"] else None
+
     return {
         "tunnel_id": row["tunnel_id"],
         "machine_name": row["machine_name"],
         "active": row["active"] and not is_expired,
         "expires_at": row["expires_at"],
         "requests_served": row["requests_served"],
-        "allowed_email": row["allowed_email"],
+        "allowed_emails": allowed_emails,
     }
 
 
@@ -245,15 +250,12 @@ async def oauth_authorize(
     tunnel_id: str = None,
 ):
     """OAuth authorization endpoint — shows login page."""
-    # If no tunnel_id in query, try to extract from client_id
     if not tunnel_id:
-        # client_id format: "hull-{tunnel_id}"
         if client_id.startswith("hull-"):
             tunnel_id = client_id[5:]
         else:
             raise HTTPException(status_code=400, detail="Invalid client_id format")
 
-    # Verify tunnel exists
     conn = get_db()
     try:
         row = conn.execute(
@@ -269,9 +271,14 @@ async def oauth_authorize(
     if row["expires_at"] < datetime.now(timezone.utc).isoformat():
         raise HTTPException(status_code=410, detail="Tunnel expired")
 
-    allowed_email = row["allowed_email"]
+    allowed_emails = json.loads(row["allowed_emails"]) if row["allowed_emails"] else None
 
     # Build login page
+    emails_info = ""
+    if allowed_emails:
+        email_list = ", ".join(f"<strong>{e}</strong>" for e in allowed_emails)
+        emails_info = f"<div class='info'>Only {email_list} can access this tunnel.</div>"
+
     login_html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -298,7 +305,7 @@ async def oauth_authorize(
         <h1>Hull</h1>
         <p class="subtitle">Sign in to access remote machine</p>
         
-        {"<div class='info'>Only <strong>" + allowed_email + "</strong> can access this tunnel.</div>" if allowed_email else ""}
+        {emails_info}
         
         <form method="POST" action="/oauth/authorize">
             <input type="hidden" name="client_id" value="{client_id}">
@@ -325,7 +332,6 @@ async def oauth_authorize_post(
     tunnel_id: str = Form(None),
 ):
     """Handle OAuth authorization — verify email and redirect."""
-    # Get tunnel
     conn = get_db()
     try:
         row = conn.execute(
@@ -338,11 +344,11 @@ async def oauth_authorize_post(
     if not row:
         raise HTTPException(status_code=404, detail="Tunnel not found")
 
-    allowed_email = row["allowed_email"]
+    allowed_emails = json.loads(row["allowed_emails"]) if row["allowed_emails"] else None
 
     # Check email if restricted
-    if allowed_email and email.lower() != allowed_email.lower():
-        # Show error page
+    if allowed_emails and email.lower() not in [e.lower() for e in allowed_emails]:
+        email_list = ", ".join(f"<strong>{e}</strong>" for e in allowed_emails)
         error_html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -361,7 +367,7 @@ async def oauth_authorize_post(
     <div class="card">
         <div class="error">Access Denied</div>
         <p>You signed in as <strong>{email}</strong></p>
-        <p>This tunnel only allows <strong>{allowed_email}</strong></p>
+        <p>This tunnel only allows: {email_list}</p>
         <p><a href="javascript:history.back()">Try again</a></p>
     </div>
 </body>
@@ -403,8 +409,6 @@ async def oauth_token(request: Request):
     body = await request.form()
     grant_type = body.get("grant_type")
     code = body.get("code")
-    client_id = body.get("client_id")
-    client_secret = body.get("client_secret")
 
     if grant_type != "authorization_code":
         raise HTTPException(status_code=400, detail="unsupported_grant_type")
@@ -512,8 +516,9 @@ async def proxy_mcp(request: Request, path: str):
     if row["expires_at"] < datetime.now(timezone.utc).isoformat():
         raise HTTPException(status_code=410, detail="Tunnel expired")
 
-    # Check auth if email is restricted
-    if row["allowed_email"]:
+    # Check auth if emails are restricted
+    allowed_emails = json.loads(row["allowed_emails"]) if row["allowed_emails"] else None
+    if allowed_emails:
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Authentication required")
@@ -536,8 +541,8 @@ async def proxy_mcp(request: Request, path: str):
         if token_row["expires_at"] < datetime.now(timezone.utc).isoformat():
             raise HTTPException(status_code=401, detail="Token expired")
 
-        if token_row["email"] != row["allowed_email"]:
-            raise HTTPException(status_code=403, detail="Email mismatch")
+        if token_row["email"] not in [e.lower() for e in allowed_emails]:
+            raise HTTPException(status_code=403, detail="Email not authorized")
 
     # Check websocket connection
     ws = active_tunnels.get(row["tunnel_id"])
