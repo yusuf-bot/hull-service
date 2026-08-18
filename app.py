@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS tunnels (
     tunnel_id TEXT PRIMARY KEY,
     url_token TEXT UNIQUE,
     allowed_emails TEXT,
+    client_id TEXT,
+    client_secret_hash TEXT,
     machine_name TEXT,
     created_at TEXT,
     expires_at TEXT,
@@ -95,6 +97,8 @@ class TunnelCreate(BaseModel):
 class TunnelResponse(BaseModel):
     tunnel_id: str
     url: str
+    client_id: str
+    client_secret: str
     expires_at: str
     ttl_seconds: int
     allowed_emails: list[str] | None = None
@@ -133,15 +137,20 @@ async def create_tunnel(req: TunnelCreate):
         time.time() + ttl, tz=timezone.utc
     ).isoformat()
 
+    # Generate OAuth client credentials for this tunnel
+    client_id = f"hull-{tunnel_id}"
+    client_secret = secrets.token_urlsafe(32)
+    client_secret_hash = _hash(client_secret)
+
     # Store emails as JSON array
     emails_json = json.dumps(req.allowed_emails) if req.allowed_emails else None
 
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO tunnels (tunnel_id, url_token, allowed_emails, machine_name, created_at, expires_at, active) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1)",
-            (tunnel_id, url_token, emails_json, req.machine_name,
+            "INSERT INTO tunnels (tunnel_id, url_token, allowed_emails, client_id, client_secret_hash, machine_name, created_at, expires_at, active) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            (tunnel_id, url_token, emails_json, client_id, client_secret_hash, req.machine_name,
              datetime.now(timezone.utc).isoformat(), expires_at),
         )
         conn.commit()
@@ -151,6 +160,8 @@ async def create_tunnel(req: TunnelCreate):
     return TunnelResponse(
         tunnel_id=tunnel_id,
         url=f"{BASE_URL}/{url_token}",
+        client_id=client_id,
+        client_secret=client_secret,
         expires_at=expires_at,
         ttl_seconds=ttl,
         allowed_emails=req.allowed_emails,
@@ -409,20 +420,36 @@ async def oauth_token(request: Request):
     body = await request.form()
     grant_type = body.get("grant_type")
     code = body.get("code")
+    client_id = body.get("client_id")
+    client_secret = body.get("client_secret")
 
     if grant_type != "authorization_code":
         raise HTTPException(status_code=400, detail="unsupported_grant_type")
 
-    if not code:
+    if not code or not client_id:
         raise HTTPException(status_code=400, detail="invalid_request")
+
+    # Verify client_id and client_secret
+    client_secret_hash = _hash(client_secret) if client_secret else None
+    conn = get_db()
+    try:
+        tunnel_row = conn.execute(
+            "SELECT * FROM tunnels WHERE client_id = ? AND client_secret_hash = ?",
+            (client_id, client_secret_hash),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not tunnel_row:
+        raise HTTPException(status_code=401, detail="invalid_client")
 
     # Verify code
     code_hash = _hash(code)
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT * FROM oauth_codes WHERE code = ? AND used = 0",
-            (code_hash,),
+            "SELECT * FROM oauth_codes WHERE code = ? AND used = 0 AND tunnel_id = ?",
+            (code_hash, tunnel_row["tunnel_id"]),
         ).fetchone()
 
         if not row:
