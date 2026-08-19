@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlencode
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException, Form
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -628,12 +628,16 @@ async def proxy_mcp(request: Request, path: str):
 
         # Decode response body
         resp_body_b64 = result.get("body_b64", "")
-        resp_body = base64.b64decode(resp_body_b64).decode("utf-8", errors="replace") if resp_body_b64 else ""
+        resp_body = base64.b64decode(resp_body_b64) if resp_body_b64 else b""
 
-        return JSONResponse(
-            content=resp_body if resp_body else "",
+        # Get content-type from upstream response, default to text/event-stream for SSE
+        resp_headers = result.get("headers", {})
+        content_type = resp_headers.get("content-type", resp_headers.get("Content-Type", "text/event-stream"))
+
+        return Response(
+            content=resp_body,
             status_code=result.get("status", 200),
-            headers=result.get("headers", {}),
+            media_type=content_type,
         )
 
     except asyncio.TimeoutError:
