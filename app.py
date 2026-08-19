@@ -305,17 +305,17 @@ async def oauth_authorize(
 <head>
     <title>Hull — Sign In</title>
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-               display: flex; justify-content: center; align-items: center; min-height: 100vh; 
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               display: flex; justify-content: center; align-items: center; min-height: 100vh;
                margin: 0; background: #f5f5f5; }}
         .card {{ background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);
                 max-width: 400px; width: 100%; }}
         h1 {{ margin: 0 0 0.5rem 0; font-size: 1.5rem; }}
         .subtitle {{ color: #666; margin-bottom: 1.5rem; }}
         .info {{ background: #f0f7ff; padding: 1rem; border-radius: 4px; margin-bottom: 1.5rem; font-size: 0.9rem; }}
-        input {{ width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; 
+        input {{ width: 100%; padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px;
                 font-size: 1rem; box-sizing: border-box; margin-bottom: 1rem; }}
-        button {{ width: 100%; padding: 0.75rem; background: #000; color: white; border: none; 
+        button {{ width: 100%; padding: 0.75rem; background: #000; color: white; border: none;
                  border-radius: 4px; font-size: 1rem; cursor: pointer; }}
         button:hover {{ background: #333; }}
         .error {{ color: #d32f2f; margin-bottom: 1rem; }}
@@ -325,15 +325,15 @@ async def oauth_authorize(
     <div class="card">
         <h1>Hull</h1>
         <p class="subtitle">Sign in to access remote machine</p>
-        
+
         {emails_info}
-        
+
         <form method="POST" action="/oauth/authorize">
             <input type="hidden" name="client_id" value="{client_id}">
             <input type="hidden" name="redirect_uri" value="{redirect_uri}">
             <input type="hidden" name="state" value="{state}">
             <input type="hidden" name="tunnel_id" value="{tunnel_id}">
-            
+
             <input type="email" name="email" placeholder="Email address" required autofocus>
             <button type="submit">Continue</button>
         </form>
@@ -375,8 +375,8 @@ async def oauth_authorize_post(
 <head>
     <title>Hull — Access Denied</title>
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-               display: flex; justify-content: center; align-items: center; min-height: 100vh; 
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               display: flex; justify-content: center; align-items: center; min-height: 100vh;
                margin: 0; background: #f5f5f5; }}
         .card {{ background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);
                 max-width: 400px; width: 100%; text-align: center; }}
@@ -538,6 +538,10 @@ import asyncio
 pending_requests: dict[str, asyncio.Future] = {}
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "hull"}
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_mcp(request: Request, path: str):
     """Proxy MCP requests through the tunnel to the user's hull server."""
@@ -630,14 +634,17 @@ async def proxy_mcp(request: Request, path: str):
         resp_body_b64 = result.get("body_b64", "")
         resp_body = base64.b64decode(resp_body_b64) if resp_body_b64 else b""
 
-        # Get content-type from upstream response, default to text/event-stream for SSE
-        resp_headers = result.get("headers", {})
-        content_type = resp_headers.get("content-type", resp_headers.get("Content-Type", "text/event-stream"))
+         # Get all response headers from upstream
+        resp_headers = dict(result.get("headers", {}))
+
+        # Build response headers (skip hop-by-hop headers)
+        skip = {"content-length", "transfer-encoding", "connection", "keep-alive", "upgrade"}
+        out_headers = {k: v for k, v in resp_headers.items() if k.lower() not in skip}
 
         return Response(
             content=resp_body,
             status_code=result.get("status", 200),
-            media_type=content_type,
+            headers=out_headers,
         )
 
     except asyncio.TimeoutError:
@@ -646,6 +653,4 @@ async def proxy_mcp(request: Request, path: str):
         pending_requests.pop(request_id, None)
 
 
-@app.get("/health")
-async def health():
     return {"status": "ok", "service": "hull"}
