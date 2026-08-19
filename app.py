@@ -232,8 +232,19 @@ async def tunnel_websocket(websocket: WebSocket, tunnel_id: str):
 
     try:
         while True:
-            data = await websocket.receive_text()
+            data = await websocket.receive_json()
+
+            # Handle response from hull server
+            if data.get("type") == "res":
+                req_id = data.get("id")
+                if req_id and req_id in pending_requests:
+                    future = pending_requests[req_id]
+                    if not future.done():
+                        future.set_result(data)
+
     except WebSocketDisconnect:
+        active_tunnels.pop(tunnel_id, None)
+    except Exception:
         active_tunnels.pop(tunnel_id, None)
 
 
@@ -287,8 +298,7 @@ async def oauth_authorize(
     # Build login page
     emails_info = ""
     if allowed_emails:
-        email_list = ", ".join(f"<strong>{e}</strong>" for e in allowed_emails)
-        emails_info = f"<div class='info'>Only {email_list} can access this tunnel.</div>"
+        emails_info = "<div class='info'>This tunnel requires authorization.</div>"
 
     login_html = f"""<!DOCTYPE html>
 <html>
@@ -522,6 +532,12 @@ async def oauth_userinfo(request: Request):
 
 # ─── Proxy ──────────────────────────────────────────────────────────────────
 
+# Pending WebSocket responses: request_id -> asyncio.Future
+import asyncio
+
+pending_requests: dict[str, asyncio.Future] = {}
+
+
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_mcp(request: Request, path: str):
     """Proxy MCP requests through the tunnel to the user's hull server."""
@@ -574,7 +590,7 @@ async def proxy_mcp(request: Request, path: str):
     # Check websocket connection
     ws = active_tunnels.get(row["tunnel_id"])
     if not ws:
-        raise HTTPException(status_code=503, detail="Hull server not connected")
+        raise HTTPException(status_code=503, detail="Hull server not connected. Is hull running on the remote machine?")
 
     # Increment request counter
     conn = get_db()
@@ -587,11 +603,37 @@ async def proxy_mcp(request: Request, path: str):
     finally:
         conn.close()
 
-    # Forward request through WebSocket (placeholder)
-    return JSONResponse({
-        "status": "ok",
-        "message": f"Request forwarded to tunnel {row['tunnel_id']}",
-    })
+    # Forward request through WebSocket
+    request_id = secrets.token_urlsafe(8)
+    body = await request.body()
+
+    future = asyncio.get_event_loop().create_future()
+    pending_requests[request_id] = future
+
+    try:
+        # Send request to hull server via WebSocket
+        await ws.send_json({
+            "type": "req",
+            "id": request_id,
+            "method": request.method,
+            "path": "/" + path if path else "/",
+            "headers": dict(request.headers),
+            "body": body.decode("utf-8", errors="replace"),
+        })
+
+        # Wait for response (5 second timeout)
+        result = await asyncio.wait_for(future, timeout=5.0)
+
+        return JSONResponse(
+            content=result.get("body", ""),
+            status_code=result.get("status", 200),
+            headers=result.get("headers", {}),
+        )
+
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Hull server did not respond")
+    finally:
+        pending_requests.pop(request_id, None)
 
 
 @app.get("/health")
