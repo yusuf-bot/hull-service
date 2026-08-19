@@ -616,7 +616,7 @@ async def proxy_mcp(request: Request, path: str):
             "type": "req",
             "id": request_id,
             "method": request.method,
-            "path": "/" + path if path else "/",
+            "path": "/mcp",
             "headers": dict(request.headers),
             "body": body.decode("utf-8", errors="replace"),
         })
