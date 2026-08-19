@@ -604,8 +604,10 @@ async def proxy_mcp(request: Request, path: str):
         conn.close()
 
     # Forward request through WebSocket
+    import base64
     request_id = secrets.token_urlsafe(8)
     body = await request.body()
+    body_b64 = base64.b64encode(body).decode()
 
     future = asyncio.get_event_loop().create_future()
     pending_requests[request_id] = future
@@ -617,15 +619,19 @@ async def proxy_mcp(request: Request, path: str):
             "id": request_id,
             "method": request.method,
             "path": "/mcp",
-            "headers": dict(request.headers),
-            "body": body.decode("utf-8", errors="replace"),
+            "headers": {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+            "body_b64": body_b64,
         })
 
-        # Wait for response (5 second timeout)
-        result = await asyncio.wait_for(future, timeout=5.0)
+        # Wait for response (10 second timeout)
+        result = await asyncio.wait_for(future, timeout=10.0)
+
+        # Decode response body
+        resp_body_b64 = result.get("body_b64", "")
+        resp_body = base64.b64decode(resp_body_b64).decode("utf-8", errors="replace") if resp_body_b64 else ""
 
         return JSONResponse(
-            content=result.get("body", ""),
+            content=resp_body if resp_body else "",
             status_code=result.get("status", 200),
             headers=result.get("headers", {}),
         )
