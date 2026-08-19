@@ -641,6 +641,9 @@ async def proxy_mcp(request: Request, path: str):
         skip = {"content-length", "transfer-encoding", "connection", "keep-alive", "upgrade"}
         out_headers = {k: v for k, v in resp_headers.items() if k.lower() not in skip}
 
+        print(f"[proxy] Response headers from hull server: {dict(resp_headers)}")
+        print(f"[proxy] Headers sent to client: {dict(out_headers)}")
+
         return Response(
             content=resp_body,
             status_code=result.get("status", 200),
