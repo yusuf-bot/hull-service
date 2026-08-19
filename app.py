@@ -464,11 +464,20 @@ async def oauth_token(request: Request):
     client_id = body.get("client_id")
     client_secret = body.get("client_secret")
     code_verifier = body.get("code_verifier")
+    
+    print(f"[oauth/token] Received token request:")
+    print(f"  grant_type: {grant_type}")
+    print(f"  code: {code[:10] if code else 'None'}...")
+    print(f"  client_id: {client_id}")
+    print(f"  client_secret: {client_secret[:10] if client_secret else 'None'}...")
+    print(f"  code_verifier: {code_verifier[:10] if code_verifier else 'None'}...")
 
     if grant_type != "authorization_code":
+        print(f"[oauth/token] ERROR: unsupported_grant_type: {grant_type}")
         raise HTTPException(status_code=400, detail="unsupported_grant_type")
 
     if not code or not client_id:
+        print(f"[oauth/token] ERROR: missing code or client_id")
         raise HTTPException(status_code=400, detail="invalid_request")
 
     # Verify client_id and client_secret
@@ -535,6 +544,8 @@ async def oauth_token(request: Request):
     finally:
         conn.close()
 
+    print(f"[oauth/token] SUCCESS: Generated token for tunnel {row['tunnel_id']}, email {row['email']}")
+    print(f"[oauth/token] Response: token_type=Bearer, expires_in=3600")
     return {
         "access_token": access_token,
         "token_type": "Bearer",
@@ -546,7 +557,9 @@ async def oauth_token(request: Request):
 async def oauth_userinfo(request: Request):
     """Return user info for verified token."""
     auth_header = request.headers.get("Authorization", "")
+    print(f"[oauth/userinfo] Received userinfo request, auth: {auth_header[:30]}...")
     if not auth_header.startswith("Bearer "):
+        print(f"[oauth/userinfo] ERROR: missing Bearer token")
         raise HTTPException(status_code=401, detail="missing_token")
 
     token = auth_header[7:]
@@ -562,11 +575,14 @@ async def oauth_userinfo(request: Request):
         conn.close()
 
     if not row:
+        print(f"[oauth/userinfo] ERROR: invalid token")
         raise HTTPException(status_code=401, detail="invalid_token")
 
     if row["expires_at"] < datetime.now(timezone.utc).isoformat():
+        print(f"[oauth/userinfo] ERROR: token expired")
         raise HTTPException(status_code=401, detail="expired_token")
 
+    print(f"[oauth/userinfo] SUCCESS: returning info for email {row['email']}")
     return {
         "sub": row["email"],
         "email": row["email"],
