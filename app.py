@@ -66,6 +66,13 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     created_at TEXT,
     expires_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    client_secret_hash TEXT,
+    redirect_uris TEXT,
+    created_at TEXT
+);
 """
 
 
@@ -269,6 +276,7 @@ async def oauth_metadata():
         "issuer": BASE_URL,
         "authorization_endpoint": f"{BASE_URL}/oauth/authorize",
         "token_endpoint": f"{BASE_URL}/oauth/token",
+        "registration_endpoint": f"{BASE_URL}/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "token_endpoint_auth_methods_supported": ["client_secret_post"],
@@ -280,11 +288,86 @@ async def oauth_metadata():
 @app.get("/.well-known/oauth-protected-resource/{path:path}")
 async def oauth_protected_resource(path: str = ""):
     """Protected resource metadata — tells clients where to get auth."""
+    # If the path is a tunnel url_token, advertise the tunnel-specific resource
+    # so clients send resource=<tunnel URL> and we can identify the tunnel.
+    resource = BASE_URL
+    if path:
+        conn = get_db()
+        try:
+            row = conn.execute(
+                "SELECT * FROM tunnels WHERE url_token = ? AND active = 1",
+                (path,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row:
+            resource = f"{BASE_URL}/{path}"
     return {
-        "resource": BASE_URL,
+        "resource": resource,
         "authorization_servers": [BASE_URL],
         "bearer_methods_supported": ["header"],
     }
+
+
+@app.post("/register")
+async def register_client(request: Request):
+    """Dynamic Client Registration (RFC 7591)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    redirect_uris = body.get("redirect_uris") or []
+    client_id = "dyn-" + secrets.token_urlsafe(16)
+    client_secret = secrets.token_urlsafe(32)
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO oauth_clients (client_id, client_secret_hash, redirect_uris, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (client_id, _hash(client_secret), json.dumps(redirect_uris),
+             datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"[register] Created dynamic client {client_id}")
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_id_issued_at": int(time.time()),
+        "client_secret_expires_at": 0,
+        "token_endpoint_auth_method": "client_secret_post",
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    }
+
+
+def _resolve_tunnel_id(client_id: str | None, resource: str | None) -> str | None:
+    """Resolve a tunnel_id from a pre-registered client_id or the resource param."""
+    if client_id and client_id.startswith("hull-"):
+        return client_id[5:]
+
+    if resource:
+        try:
+            path = urlparse(resource).path.strip("/")
+        except Exception:
+            path = ""
+        if path:
+            conn = get_db()
+            try:
+                row = conn.execute(
+                    "SELECT tunnel_id FROM tunnels WHERE url_token = ? AND active = 1",
+                    (path,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row:
+                return row["tunnel_id"]
+    return None
 
 
 @app.get("/oauth/authorize")
@@ -296,13 +379,14 @@ async def oauth_authorize(
     tunnel_id: str = None,
     code_challenge: str = None,
     code_challenge_method: str = None,
+    resource: str = None,
 ):
     """OAuth authorization endpoint — shows login page."""
     if not tunnel_id:
-        if client_id.startswith("hull-"):
-            tunnel_id = client_id[5:]
-        else:
-            raise HTTPException(status_code=400, detail="Invalid client_id format")
+        tunnel_id = _resolve_tunnel_id(client_id, resource)
+
+    if not tunnel_id:
+        raise HTTPException(status_code=400, detail="Could not determine tunnel for authorization")
 
     conn = get_db()
     try:
@@ -488,20 +572,38 @@ async def oauth_token(request: Request):
             "SELECT * FROM tunnels WHERE client_id = ? AND client_secret_hash = ?",
             (client_id, client_secret_hash),
         ).fetchone()
+
+        # Dynamic clients (registered via /register) are tunnel-agnostic credentials;
+        # the code itself is already bound to a tunnel.
+        dyn_row = None
+        if not tunnel_row:
+            dyn_row = conn.execute(
+                "SELECT * FROM oauth_clients WHERE client_id = ? AND client_secret_hash = ?",
+                (client_id, client_secret_hash),
+            ).fetchone()
     finally:
         conn.close()
 
-    if not tunnel_row:
+    if not tunnel_row and not dyn_row:
+        print(f"[oauth/token] ERROR: invalid_client for {client_id}")
         raise HTTPException(status_code=401, detail="invalid_client")
 
-    # Verify code
+    # Verify code (the code is already bound to a tunnel; dyn clients are
+    # tunnel-agnostic credentials, so only scope by tunnel for pre-registered clients)
     code_hash = _hash(code)
+    bound_tunnel = tunnel_row["tunnel_id"] if tunnel_row else None
     conn = get_db()
     try:
-        row = conn.execute(
-            "SELECT * FROM oauth_codes WHERE code = ? AND used = 0 AND tunnel_id = ?",
-            (code_hash, tunnel_row["tunnel_id"]),
-        ).fetchone()
+        if bound_tunnel:
+            row = conn.execute(
+                "SELECT * FROM oauth_codes WHERE code = ? AND used = 0 AND tunnel_id = ?",
+                (code_hash, bound_tunnel),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM oauth_codes WHERE code = ? AND used = 0",
+                (code_hash,),
+            ).fetchone()
 
         if not row:
             raise HTTPException(status_code=400, detail="invalid_grant")
