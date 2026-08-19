@@ -54,7 +54,9 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     email TEXT,
     created_at TEXT,
     expires_at TEXT,
-    used INTEGER DEFAULT 0
+    used INTEGER DEFAULT 0,
+    code_challenge TEXT,
+    code_challenge_method TEXT
 );
 
 CREATE TABLE IF NOT EXISTS oauth_tokens (
@@ -78,6 +80,15 @@ def get_db():
 def init_db():
     conn = get_db()
     conn.executescript(SCHEMA)
+    # Migrations for existing databases
+    try:
+        conn.execute("ALTER TABLE oauth_codes ADD COLUMN code_challenge TEXT")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE oauth_codes ADD COLUMN code_challenge_method TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -119,6 +130,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Mcp-Session-Id", "mcp-session-id"],
 )
 
 # Active tunnel connections: tunnel_id -> WebSocket
@@ -260,6 +272,18 @@ async def oauth_metadata():
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "code_challenge_methods_supported": ["S256"],
+    }
+
+
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/{path:path}")
+async def oauth_protected_resource(path: str = ""):
+    """Protected resource metadata — tells clients where to get auth."""
+    return {
+        "resource": BASE_URL,
+        "authorization_servers": [BASE_URL],
+        "bearer_methods_supported": ["header"],
     }
 
 
@@ -270,6 +294,8 @@ async def oauth_authorize(
     redirect_uri: str,
     state: str,
     tunnel_id: str = None,
+    code_challenge: str = None,
+    code_challenge_method: str = None,
 ):
     """OAuth authorization endpoint — shows login page."""
     if not tunnel_id:
@@ -333,6 +359,8 @@ async def oauth_authorize(
             <input type="hidden" name="redirect_uri" value="{redirect_uri}">
             <input type="hidden" name="state" value="{state}">
             <input type="hidden" name="tunnel_id" value="{tunnel_id}">
+            <input type="hidden" name="code_challenge" value="{code_challenge or ''}">
+            <input type="hidden" name="code_challenge_method" value="{code_challenge_method or ''}">
 
             <input type="email" name="email" placeholder="Email address" required autofocus>
             <button type="submit">Continue</button>
@@ -351,6 +379,8 @@ async def oauth_authorize_post(
     redirect_uri: str = Form(...),
     state: str = Form(...),
     tunnel_id: str = Form(None),
+    code_challenge: str = Form(None),
+    code_challenge_method: str = Form(None),
 ):
     """Handle OAuth authorization — verify email and redirect."""
     conn = get_db()
@@ -405,10 +435,11 @@ async def oauth_authorize_post(
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO oauth_codes (code, tunnel_id, email, created_at, expires_at, used) "
-            "VALUES (?, ?, ?, ?, ?, 0)",
+            "INSERT INTO oauth_codes (code, tunnel_id, email, created_at, expires_at, used, code_challenge, code_challenge_method) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
             (code_hash, tunnel_id, email.lower(),
-             datetime.now(timezone.utc).isoformat(), expires_at),
+             datetime.now(timezone.utc).isoformat(), expires_at,
+             code_challenge, code_challenge_method),
         )
         conn.commit()
     finally:
@@ -432,6 +463,7 @@ async def oauth_token(request: Request):
     code = body.get("code")
     client_id = body.get("client_id")
     client_secret = body.get("client_secret")
+    code_verifier = body.get("code_verifier")
 
     if grant_type != "authorization_code":
         raise HTTPException(status_code=400, detail="unsupported_grant_type")
@@ -467,6 +499,18 @@ async def oauth_token(request: Request):
 
         if row["expires_at"] < datetime.now(timezone.utc).isoformat():
             raise HTTPException(status_code=400, detail="expired_grant")
+
+        # Verify PKCE code_verifier if code_challenge was set
+        stored_challenge = row["code_challenge"]
+        if stored_challenge:
+            import hashlib, base64 as _b64
+            if not code_verifier:
+                raise HTTPException(status_code=400, detail="code_verifier_required")
+            # Compute SHA-256 of code_verifier and base64url encode
+            digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+            computed_challenge = _b64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+            if computed_challenge != stored_challenge:
+                raise HTTPException(status_code=400, detail="invalid_code_verifier")
 
         # Mark code as used
         conn.execute(
@@ -545,6 +589,15 @@ async def health():
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_mcp(request: Request, path: str):
     """Proxy MCP requests through the tunnel to the user's hull server."""
+    body_bytes = await request.body()
+    auth = request.headers.get("authorization", "none")
+    print(f"[proxy] {request.method} /{path} auth={auth[:30]}... body_len={len(body_bytes)}")
+    if body_bytes:
+        try:
+            import json as _json
+            print(f"[proxy] body={body_bytes[:300].decode()}")
+        except: pass
+
     parts = path.split("/", 1) if path else []
     url_token = parts[0] if parts else ""
 
