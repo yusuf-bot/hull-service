@@ -632,33 +632,56 @@ async def proxy_mcp(request: Request, path: str):
     if row["expires_at"] < datetime.now(timezone.utc).isoformat():
         raise HTTPException(status_code=410, detail="Tunnel expired")
 
-    # Check auth if emails are restricted
+    # Always require a valid bearer token. The OAuth flow issues tokens,
+    # so the first unauthenticated request MUST return 401 so Claude Desktop
+    # discovers auth, completes OAuth, and re-sends with the token.
     allowed_emails = json.loads(row["allowed_emails"]) if row["allowed_emails"] else None
-    if allowed_emails:
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Authentication required")
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        print(f"[proxy] 401: no bearer token for /{path}")
+        return Response(
+            status_code=401,
+            content=json.dumps({"error": "invalid_token", "error_description": "Authentication required"}),
+            headers={"WWW-Authenticate": 'Bearer realm="hull"', "Content-Type": "application/json"},
+        )
 
-        token = auth_header[7:]
-        token_hash = _hash(token)
+    token = auth_header[7:]
+    token_hash = _hash(token)
 
-        conn = get_db()
-        try:
-            token_row = conn.execute(
-                "SELECT * FROM oauth_tokens WHERE token_hash = ? AND tunnel_id = ?",
-                (token_hash, row["tunnel_id"]),
-            ).fetchone()
-        finally:
-            conn.close()
+    conn = get_db()
+    try:
+        token_row = conn.execute(
+            "SELECT * FROM oauth_tokens WHERE token_hash = ? AND tunnel_id = ?",
+            (token_hash, row["tunnel_id"]),
+        ).fetchone()
+    finally:
+        conn.close()
 
-        if not token_row:
-            raise HTTPException(status_code=403, detail="Invalid token for this tunnel")
+    if not token_row:
+        print(f"[proxy] 401: invalid token for /{path}")
+        return Response(
+            status_code=401,
+            content=json.dumps({"error": "invalid_token", "error_description": "Invalid token for this tunnel"}),
+            headers={"WWW-Authenticate": 'Bearer realm="hull"', "Content-Type": "application/json"},
+        )
 
-        if token_row["expires_at"] < datetime.now(timezone.utc).isoformat():
-            raise HTTPException(status_code=401, detail="Token expired")
+    if token_row["expires_at"] < datetime.now(timezone.utc).isoformat():
+        print(f"[proxy] 401: token expired for /{path}")
+        return Response(
+            status_code=401,
+            content=json.dumps({"error": "invalid_token", "error_description": "Token expired"}),
+            headers={"WWW-Authenticate": 'Bearer realm="hull"', "Content-Type": "application/json"},
+        )
 
-        if token_row["email"] not in [e.lower() for e in allowed_emails]:
-            raise HTTPException(status_code=403, detail="Email not authorized")
+    if allowed_emails and token_row["email"] not in [e.lower() for e in allowed_emails]:
+        print(f"[proxy] 403: email {token_row['email']} not authorized for /{path}")
+        return Response(
+            status_code=403,
+            content=json.dumps({"error": "insufficient_scope", "error_description": "Email not authorized for this tunnel"}),
+            headers={"Content-Type": "application/json"},
+        )
+
+    print(f"[proxy] Auth OK for /{path} as {token_row['email']}")
 
     # Check websocket connection
     ws = active_tunnels.get(row["tunnel_id"])
