@@ -1,4 +1,4 @@
-"""Hull tunnel service — OAuth-protected tunnels for hull MCP servers.
+"""Hull tunnel service â€” OAuth-protected tunnels for hull MCP servers.
 
 Auth model:
 - Each tunnel has allowed_emails (optional JSON array)
@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, Resp
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ─── Config ──────────────────────────────────────────────────────────────────
+# â”€â”€â”€ Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 DB_PATH = Path(os.environ.get("HULL_DB_PATH", "/var/lib/hull/tunnels.db"))
 SECRET_KEY = os.environ.get("HULL_SECRET_KEY", secrets.token_hex(32))
@@ -32,7 +32,7 @@ DEFAULT_TTL = 3600  # 1 hour
 MAX_TTL = 86400     # 24 hours
 
 
-# ─── Database ────────────────────────────────────────────────────────────────
+# â”€â”€â”€ Database â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tunnels (
@@ -96,6 +96,10 @@ def init_db():
         conn.execute("ALTER TABLE oauth_codes ADD COLUMN code_challenge_method TEXT")
     except Exception:
         pass
+    try:
+        conn.execute("ALTER TABLE oauth_clients ADD COLUMN tunnel_id TEXT")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -104,7 +108,7 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-# ─── Models ──────────────────────────────────────────────────────────────────
+# â”€â”€â”€ Models â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class TunnelCreate(BaseModel):
     machine_name: str
@@ -122,7 +126,7 @@ class TunnelResponse(BaseModel):
     allowed_emails: list[str] | None = None
 
 
-# ─── App ─────────────────────────────────────────────────────────────────────
+# â”€â”€â”€ App â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -144,7 +148,7 @@ app.add_middleware(
 active_tunnels: dict[str, WebSocket] = {}
 
 
-# ─── API Endpoints ──────────────────────────────────────────────────────────
+# â”€â”€â”€ API Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.post("/api/tunnel/create", response_model=TunnelResponse)
 async def create_tunnel(req: TunnelCreate):
@@ -267,7 +271,7 @@ async def tunnel_websocket(websocket: WebSocket, tunnel_id: str):
         active_tunnels.pop(tunnel_id, None)
 
 
-# ─── OAuth Endpoints ─────────────────────────────────────────────────────────
+# â”€â”€â”€ OAuth Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_metadata():
@@ -287,7 +291,7 @@ async def oauth_metadata():
 @app.get("/.well-known/oauth-protected-resource")
 @app.get("/.well-known/oauth-protected-resource/{path:path}")
 async def oauth_protected_resource(path: str = ""):
-    """Protected resource metadata — tells clients where to get auth."""
+    """Protected resource metadata â€” tells clients where to get auth."""
     # If the path is a tunnel url_token, advertise the tunnel-specific resource
     # so clients send resource=<tunnel URL> and we can identify the tunnel.
     resource = BASE_URL
@@ -302,16 +306,17 @@ async def oauth_protected_resource(path: str = ""):
             conn.close()
         if row:
             resource = f"{BASE_URL}/{path}"
+    reg_endpoint = f"{BASE_URL}/{path}/register" if path else f"{BASE_URL}/register"
     return {
         "resource": resource,
         "authorization_servers": [BASE_URL],
         "bearer_methods_supported": ["header"],
+        "registration_endpoint": reg_endpoint,
     }
 
 
-@app.post("/register")
-async def register_client(request: Request):
-    """Dynamic Client Registration (RFC 7591)."""
+async def _register_client(request: Request, tunnel_id: str | None):
+    """Shared Dynamic Client Registration (RFC 7591) logic."""
     try:
         body = await request.json()
     except Exception:
@@ -324,16 +329,16 @@ async def register_client(request: Request):
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO oauth_clients (client_id, client_secret_hash, redirect_uris, created_at) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO oauth_clients (client_id, client_secret_hash, redirect_uris, created_at, tunnel_id) "
+            "VALUES (?, ?, ?, ?, ?)",
             (client_id, _hash(client_secret), json.dumps(redirect_uris),
-             datetime.now(timezone.utc).isoformat()),
+             datetime.now(timezone.utc).isoformat(), tunnel_id),
         )
         conn.commit()
     finally:
         conn.close()
 
-    print(f"[register] Created dynamic client {client_id}")
+    print(f"[register] Created dynamic client {client_id} for tunnel {tunnel_id}")
     return {
         "client_id": client_id,
         "client_secret": client_secret,
@@ -346,10 +351,47 @@ async def register_client(request: Request):
     }
 
 
+@app.post("/register")
+async def register_client(request: Request):
+    """Dynamic Client Registration (RFC 7591) - global, tunnel-agnostic (legacy)."""
+    return await _register_client(request, tunnel_id=None)
+
+
+@app.post("/{url_token}/register")
+async def register_client_for_tunnel(url_token: str, request: Request):
+    """Dynamic Client Registration scoped to a specific tunnel."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT tunnel_id FROM tunnels WHERE url_token = ? AND active = 1",
+            (url_token,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Tunnel not found or expired")
+
+    return await _register_client(request, tunnel_id=row["tunnel_id"])
+
+
 def _resolve_tunnel_id(client_id: str | None, resource: str | None) -> str | None:
-    """Resolve a tunnel_id from a pre-registered client_id or the resource param."""
+    """Resolve a tunnel_id from a pre-registered client_id, a dynamically
+    registered (tunnel-scoped) client_id, or the resource param."""
     if client_id and client_id.startswith("hull-"):
         return client_id[5:]
+
+    if client_id and client_id.startswith("dyn-"):
+        conn = get_db()
+        try:
+            row = conn.execute(
+                "SELECT tunnel_id FROM oauth_clients WHERE client_id = ?",
+                (client_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row["tunnel_id"]:
+            return row["tunnel_id"]
 
     if resource:
         try:
@@ -381,7 +423,7 @@ async def oauth_authorize(
     code_challenge_method: str = None,
     resource: str = None,
 ):
-    """OAuth authorization endpoint — shows login page."""
+    """OAuth authorization endpoint â€” shows login page."""
     if not tunnel_id:
         tunnel_id = _resolve_tunnel_id(client_id, resource)
 
@@ -413,7 +455,7 @@ async def oauth_authorize(
     login_html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Hull — Sign In</title>
+    <title>Hull â€” Sign In</title>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                display: flex; justify-content: center; align-items: center; min-height: 100vh;
@@ -466,7 +508,7 @@ async def oauth_authorize_post(
     code_challenge: str = Form(None),
     code_challenge_method: str = Form(None),
 ):
-    """Handle OAuth authorization — verify email and redirect."""
+    """Handle OAuth authorization â€” verify email and redirect."""
     conn = get_db()
     try:
         row = conn.execute(
@@ -487,7 +529,7 @@ async def oauth_authorize_post(
         error_html = f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>Hull — Access Denied</title>
+    <title>Hull â€” Access Denied</title>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                display: flex; justify-content: center; align-items: center; min-height: 100vh;
@@ -692,7 +734,7 @@ async def oauth_userinfo(request: Request):
     }
 
 
-# ─── Proxy ──────────────────────────────────────────────────────────────────
+# â”€â”€â”€ Proxy â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # Pending WebSocket responses: request_id -> asyncio.Future
 import asyncio
