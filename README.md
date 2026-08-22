@@ -45,6 +45,20 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | `HULL_BASE_URL` | `https://hull.openexplorer.xyz` | Public base URL |
 | `HULL_PORT` | `8000` | Server port |
 
+## Authentication
+
+- **With emails**: When `allowed_emails` is set, OAuth flow is required. Claude Desktop will show a login page.
+- **Without emails**: Tunnel is open. Anyone with the URL can access it (no auth required).
+
+For quick testing, create a tunnel without `--email`:
+```bash
+# On the hull machine
+hull run --remote  # No --email = open tunnel
+
+# Or with Python directly
+python -c "from hull.cli import cli; cli()" run --remote
+```
+
 ## Production Deploy (Ubuntu)
 
 ```bash

@@ -291,27 +291,76 @@ async def oauth_metadata():
 @app.get("/.well-known/oauth-protected-resource")
 @app.get("/.well-known/oauth-protected-resource/{path:path}")
 async def oauth_protected_resource(path: str = ""):
-    """Protected resource metadata â€” tells clients where to get auth."""
-    # If the path is a tunnel url_token, advertise the tunnel-specific resource
-    # so clients send resource=<tunnel URL> and we can identify the tunnel.
+    """Protected resource metadata â€” tells clients where to get auth.
+
+    For tunnel paths ({url_token}/mcp) we advertise the tunnel itself as the
+    authorization server, so OAuth discovery and the whole flow are handled
+    by the user's own hull server behind the tunnel.
+    """
     resource = BASE_URL
+    as_url = None
     if path:
+        # First path segment is the tunnel url_token
+        token = path.split("/", 1)[0]
         conn = get_db()
         try:
             row = conn.execute(
                 "SELECT * FROM tunnels WHERE url_token = ? AND active = 1",
-                (path,),
+                (token,),
             ).fetchone()
         finally:
             conn.close()
         if row:
+            as_url = f"{BASE_URL}/{token}"
             resource = f"{BASE_URL}/{path}"
+
+    if as_url:
+        return {
+            "resource": resource,
+            "authorization_servers": [as_url],
+            "bearer_methods_supported": ["header"],
+        }
+
     reg_endpoint = f"{BASE_URL}/{path}/register" if path else f"{BASE_URL}/register"
     return {
         "resource": resource,
         "authorization_servers": [BASE_URL],
         "bearer_methods_supported": ["header"],
         "registration_endpoint": reg_endpoint,
+    }
+
+
+@app.get("/.well-known/oauth-authorization-server/{url_token:path}")
+async def oauth_metadata_for_tunnel(url_token: str):
+    """Authorization-server metadata scoped to a tunnel.
+
+    RFC 8414 path-aware discovery: for issuer {BASE_URL}/{token} clients fetch
+    /.well-known/oauth-authorization-server/{token}. We point every endpoint
+    back through the tunnel so the local hull server handles all of OAuth
+    (registration, authorize, login, token).
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM tunnels WHERE url_token = ? AND active = 1",
+            (url_token,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Tunnel not found or expired")
+
+    base = f"{BASE_URL}/{url_token}"
+    return {
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
     }
 
 
@@ -355,24 +404,6 @@ async def _register_client(request: Request, tunnel_id: str | None):
 async def register_client(request: Request):
     """Dynamic Client Registration (RFC 7591) - global, tunnel-agnostic (legacy)."""
     return await _register_client(request, tunnel_id=None)
-
-
-@app.post("/{url_token}/register")
-async def register_client_for_tunnel(url_token: str, request: Request):
-    """Dynamic Client Registration scoped to a specific tunnel."""
-    conn = get_db()
-    try:
-        row = conn.execute(
-            "SELECT tunnel_id FROM tunnels WHERE url_token = ? AND active = 1",
-            (url_token,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Tunnel not found or expired")
-
-    return await _register_client(request, tunnel_id=row["tunnel_id"])
 
 
 def _resolve_tunnel_id(client_id: str | None, resource: str | None) -> str | None:
@@ -746,7 +777,7 @@ pending_requests: dict[str, asyncio.Future] = {}
 async def health():
     return {"status": "ok", "service": "hull"}
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_mcp(request: Request, path: str):
     """Proxy MCP requests through the tunnel to the user's hull server."""
     body_bytes = await request.body()
@@ -760,6 +791,9 @@ async def proxy_mcp(request: Request, path: str):
 
     parts = path.split("/", 1) if path else []
     url_token = parts[0] if parts else ""
+    # Forward whatever comes after the url_token (e.g. /mcp, /authorize,
+    # /token, /auth/login) to the same path on the local hull server.
+    sub_path = f"/{parts[1]}" if len(parts) > 1 else "/mcp"
 
     conn = get_db()
     try:
@@ -776,56 +810,59 @@ async def proxy_mcp(request: Request, path: str):
     if row["expires_at"] < datetime.now(timezone.utc).isoformat():
         raise HTTPException(status_code=410, detail="Tunnel expired")
 
-    # Always require a valid bearer token. The OAuth flow issues tokens,
-    # so the first unauthenticated request MUST return 401 so Claude Desktop
-    # discovers auth, completes OAuth, and re-sends with the token.
     allowed_emails = json.loads(row["allowed_emails"]) if row["allowed_emails"] else None
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        print(f"[proxy] 401: no bearer token for /{path}")
-        return Response(
-            status_code=401,
-            content=json.dumps({"error": "invalid_token", "error_description": "Authentication required"}),
-            headers={"WWW-Authenticate": 'Bearer realm="hull"', "Content-Type": "application/json"},
-        )
 
-    token = auth_header[7:]
-    token_hash = _hash(token)
+    # If no email restriction, allow unauthenticated access (open tunnel)
+    if not allowed_emails:
+        print(f"[proxy] Open tunnel (no auth required) for /{path}")
+    else:
+        # Require bearer token when emails are configured
+        if not auth_header.startswith("Bearer "):
+            print(f"[proxy] 401: no bearer token for /{path}")
+            return Response(
+                status_code=401,
+                content=json.dumps({"error": "invalid_token", "error_description": "Authentication required"}),
+                headers={"WWW-Authenticate": 'Bearer realm="hull"', "Content-Type": "application/json"},
+            )
 
-    conn = get_db()
-    try:
-        token_row = conn.execute(
-            "SELECT * FROM oauth_tokens WHERE token_hash = ? AND tunnel_id = ?",
-            (token_hash, row["tunnel_id"]),
-        ).fetchone()
-    finally:
-        conn.close()
+        token = auth_header[7:]
+        token_hash = _hash(token)
 
-    if not token_row:
-        print(f"[proxy] 401: invalid token for /{path}")
-        return Response(
-            status_code=401,
-            content=json.dumps({"error": "invalid_token", "error_description": "Invalid token for this tunnel"}),
-            headers={"WWW-Authenticate": 'Bearer realm="hull"', "Content-Type": "application/json"},
-        )
+        conn = get_db()
+        try:
+            token_row = conn.execute(
+                "SELECT * FROM oauth_tokens WHERE token_hash = ? AND tunnel_id = ?",
+                (token_hash, row["tunnel_id"]),
+            ).fetchone()
+        finally:
+            conn.close()
 
-    if token_row["expires_at"] < datetime.now(timezone.utc).isoformat():
-        print(f"[proxy] 401: token expired for /{path}")
-        return Response(
-            status_code=401,
-            content=json.dumps({"error": "invalid_token", "error_description": "Token expired"}),
-            headers={"WWW-Authenticate": 'Bearer realm="hull"', "Content-Type": "application/json"},
-        )
+        if not token_row:
+            print(f"[proxy] 401: invalid token for /{path}")
+            return Response(
+                status_code=401,
+                content=json.dumps({"error": "invalid_token", "error_description": "Invalid token for this tunnel"}),
+                headers={"WWW-Authenticate": 'Bearer realm="hull"', "Content-Type": "application/json"},
+            )
 
-    if allowed_emails and token_row["email"] not in [e.lower() for e in allowed_emails]:
-        print(f"[proxy] 403: email {token_row['email']} not authorized for /{path}")
-        return Response(
-            status_code=403,
-            content=json.dumps({"error": "insufficient_scope", "error_description": "Email not authorized for this tunnel"}),
-            headers={"Content-Type": "application/json"},
-        )
+        if token_row["expires_at"] < datetime.now(timezone.utc).isoformat():
+            print(f"[proxy] 401: token expired for /{path}")
+            return Response(
+                status_code=401,
+                content=json.dumps({"error": "invalid_token", "error_description": "Token expired"}),
+                headers={"WWW-Authenticate": 'Bearer realm="hull"', "Content-Type": "application/json"},
+            )
 
-    print(f"[proxy] Auth OK for /{path} as {token_row['email']}")
+        if token_row["email"] not in [e.lower() for e in allowed_emails]:
+            print(f"[proxy] 403: email {token_row['email']} not authorized for /{path}")
+            return Response(
+                status_code=403,
+                content=json.dumps({"error": "insufficient_scope", "error_description": "Email not authorized for this tunnel"}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        print(f"[proxy] Auth OK for /{path} as {token_row['email']}")
 
     # Check websocket connection
     ws = active_tunnels.get(row["tunnel_id"])
@@ -858,7 +895,7 @@ async def proxy_mcp(request: Request, path: str):
             "type": "req",
             "id": request_id,
             "method": request.method,
-            "path": "/mcp",
+            "path": sub_path,
             "headers": {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
             "body_b64": body_b64,
         })
